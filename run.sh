@@ -80,6 +80,12 @@ VPN_USER=$(noquotes "$VPN_USER")
 VPN_PASSWORD=$(nospaces "$VPN_PASSWORD")
 VPN_PASSWORD=$(noquotes "$VPN_PASSWORD")
 
+
+VPN_NAS_IDENTIFIER=$(nospaces "$VPN_NAS_IDENTIFIER")
+VPN_NAS_IDENTIFIER=$(noquotes "$VPN_NAS_IDENTIFIER")
+VPN_CONNECT_INFO=$(nospaces "$VPN_CONNECT_INFO")
+VPN_CONNECT_INFO=$(noquotes "$VPN_CONNECT_INFO")
+
 if [ -n "$VPN_ADDL_USERS" ] && [ -n "$VPN_ADDL_PASSWORDS" ]; then
   VPN_ADDL_USERS=$(nospaces "$VPN_ADDL_USERS")
   VPN_ADDL_USERS=$(noquotes "$VPN_ADDL_USERS")
@@ -160,7 +166,40 @@ case $VPN_SHA2_TRUNCBUG in
     ;;
 esac
 
-# Create IPsec (Libreswan) config
+cat <<EOF
+PopTOP configuring started
+
+EOF
+
+sed -i -e "/^localip/d" -e "/^remoteip/d" /etc/pptpd.conf
+
+cat>>/etc/pptpd.conf<<EOF
+localip 11.22.33.1
+remoteip 11.22.33.2-254
+EOF
+
+sed -i "/^ms-dns/d" /etc/ppp/pptpd-options
+sed -i -e "/radius.so/d" -e "/radattr.so/d" /etc/ppp/pptpd-options
+
+cat>>/etc/ppp/pptpd-options<<EOF
+ms-dns 8.8.8.8
+ms-dns 8.8.4.4  
+plugin /usr/lib/pppd/2.4.7/radius.so
+plugin /usr/lib/pppd/2.4.7/radattr.so
+EOF
+
+service pptpd restart
+
+cat <<EOF
+PopTOP configuring completed
+
+EOF
+
+cat <<EOF
+Create IPsec (Libreswan) config
+
+EOF
+
 cat > /etc/ipsec.conf <<EOF
 version 2.0
 
@@ -221,6 +260,7 @@ cat > /etc/ipsec.secrets <<EOF
 EOF
 
 # Create xl2tpd config
+#add `ppp debug = yes` in [lns default] section for debugging
 cat > /etc/xl2tpd/xl2tpd.conf <<EOF
 [global]
 port = 1701
@@ -250,6 +290,12 @@ lcp-echo-failure 4
 lcp-echo-interval 30
 connect-delay 5000
 ms-dns $DNS_SRV1
+require-pap
+plugin radius.so
+plugin radattr.so
+radius-config-file /etc/radiusclient/radiusclient.conf
+avpair NAS-Identifier=$VPN_NAS_IDENTIFIER
+avpair Connect-Info=$VPN_CONNECT_INFO
 EOF
 
 if [ -z "$VPN_DNS_SRV1" ] || [ -n "$VPN_DNS_SRV2" ]; then
@@ -377,9 +423,215 @@ Setup VPN clients: https://git.io/vpnclients
 
 EOF
 
-# Start services
-mkdir -p /run/pluto /var/run/pluto /var/run/xl2tpd
-rm -f /run/pluto/pluto.pid /var/run/pluto/pluto.pid /var/run/xl2tpd.pid
+cat <<'EOF'
+Radiusclient configuration started.
 
-/usr/local/sbin/ipsec start
+EOF
+
+RADIUS_HOST=$(nospaces "$RADIUS_HOST")
+RADIUS_HOST=$(noquotes "$RADIUS_HOST")
+RADIUS_PASS=$(nospaces "$RADIUS_PASS")
+RADIUS_PASS=$(noquotes "$RADIUS_PASS")
+
+cat>/etc/radiusclient/radiusclient.conf<<EOF
+# General settings
+# specify which authentication comes first respectively which
+# authentication is used. possible values are: "radius" and "local".
+# if you specify "radius,local" then the RADIUS server is asked
+# first then the local one. if only one keyword is specified only
+# this server is asked.
+auth_order	radius,local
+# maximum login tries a user has
+login_tries	4
+# timeout for all login tries
+# if this time is exceeded the user is kicked out
+login_timeout	60
+# name of the nologin file which when it exists disables logins. it may 
+# be extended by the ttyname which will result in 
+#a terminal specific lock (e.g. /etc/nologin.ttyS2 will disable
+# logins on /dev/ttyS2)
+nologin /etc/nologin
+# name of the issue file. it's only display when no username is passed
+# on the radlogin command line
+issue	/etc/radiusclient/issue
+
+seqfile /var/run/freeradius/freeradius.pid
+
+## RADIUS listens separated by a colon from the hostname. if
+# no port is specified /etc/services is consulted of the radius
+authserver 	$RADIUS_HOST
+# RADIUS server to use for accouting requests. All that I
+# said for authserver applies, too.
+acctserver 	$RADIUS_HOST
+
+# file holding shared secrets used for the communication
+# between the RADIUS client and server
+servers		/etc/radiusclient/servers
+# dictionary of allowed attributes and values just like in the normal 
+# RADIUS distributions
+dictionary 	/etc/radiusclient/dictionary
+
+# program to call for a RADIUS authenticated login
+login_radius	/sbin/login.radius
+# file which specifies mapping between ttyname and NAS-Port attribute
+mapfile		/etc/radiusclient/port-id-map
+# default authentication realm to append to all usernames if no
+# realm was explicitly specified by the user
+default_realm
+
+# time to wait for a reply from the RADIUS server
+radius_timeout	10
+# resend request this many times before trying the next server
+radius_retries	3
+
+#radius_deadtime	0
+
+# local address from which radius packets have to be sent
+bindaddr *
+# program to execute for local login
+# it must support the -f flag for preauthenticated login
+login_local	/bin/login
+
+EOF
+
+cat>/etc/radiusclient/servers<<EOF
+## Server Name or Client/Server pair		Key		
+## ----------------				---------------
+#
+#portmaster.elemental.net			hardlyasecret
+#portmaster2.elemental.net			donttellanyone
+#
+## uncomment the following line for simple testing of radlogin
+## with freeradius-server
+#
+#localhost/localhost				testing123
+
+$RADIUS_HOST                $RADIUS_PASS
+EOF
+
+cat>/etc/radiusclient/dictionary.microsoft<<EOF
+#
+#       Microsoft's VSA's, from RFC 2548
+#
+#       \$Id: poptop_ads_howto_8.htm,v 1.8 2008/10/02 08:11:48 wskwok Exp \$
+#
+VENDOR          Microsoft       311     Microsoft
+BEGIN VENDOR    Microsoft
+ATTRIBUTE       MS-CHAP-Response        1       string  Microsoft
+ATTRIBUTE       MS-CHAP-Error           2       string  Microsoft
+ATTRIBUTE       MS-CHAP-CPW-1           3       string  Microsoft
+ATTRIBUTE       MS-CHAP-CPW-2           4       string  Microsoft
+ATTRIBUTE       MS-CHAP-LM-Enc-PW       5       string  Microsoft
+ATTRIBUTE       MS-CHAP-NT-Enc-PW       6       string  Microsoft
+ATTRIBUTE       MS-MPPE-Encryption-Policy 7     string  Microsoft
+# This is referred to as both singular and plural in the RFC.
+# Plural seems to make more sense.
+ATTRIBUTE       MS-MPPE-Encryption-Type 8       string  Microsoft
+ATTRIBUTE       MS-MPPE-Encryption-Types  8     string  Microsoft
+ATTRIBUTE       MS-RAS-Vendor           9       integer Microsoft
+ATTRIBUTE       MS-CHAP-Domain          10      string  Microsoft
+ATTRIBUTE       MS-CHAP-Challenge       11      string  Microsoft
+ATTRIBUTE       MS-CHAP-MPPE-Keys       12      string  Microsoft encrypt=1
+ATTRIBUTE       MS-BAP-Usage            13      integer Microsoft
+ATTRIBUTE       MS-Link-Utilization-Threshold 14 integer        Microsoft
+ATTRIBUTE       MS-Link-Drop-Time-Limit 15      integer Microsoft
+ATTRIBUTE       MS-MPPE-Send-Key        16      string  Microsoft
+ATTRIBUTE       MS-MPPE-Recv-Key        17      string  Microsoft
+ATTRIBUTE       MS-RAS-Version          18      string  Microsoft
+ATTRIBUTE       MS-Old-ARAP-Password    19      string  Microsoft
+ATTRIBUTE       MS-New-ARAP-Password    20      string  Microsoft
+ATTRIBUTE       MS-ARAP-PW-Change-Reason 21     integer Microsoft
+ATTRIBUTE       MS-Filter               22      string  Microsoft
+ATTRIBUTE       MS-Acct-Auth-Type       23      integer Microsoft
+ATTRIBUTE       MS-Acct-EAP-Type        24      integer Microsoft
+ATTRIBUTE       MS-CHAP2-Response       25      string  Microsoft
+ATTRIBUTE       MS-CHAP2-Success        26      string  Microsoft
+ATTRIBUTE       MS-CHAP2-CPW            27      string  Microsoft
+ATTRIBUTE       MS-Primary-DNS-Server   28      ipaddr
+ATTRIBUTE       MS-Secondary-DNS-Server 29      ipaddr
+ATTRIBUTE       MS-Primary-NBNS-Server  30      ipaddr Microsoft
+ATTRIBUTE       MS-Secondary-NBNS-Server 31     ipaddr Microsoft
+#ATTRIBUTE      MS-ARAP-Challenge       33      string  Microsoft
+#
+#       Integer Translations
+#
+#       MS-BAP-Usage Values
+VALUE           MS-BAP-Usage            Not-Allowed     0
+VALUE           MS-BAP-Usage            Allowed         1
+VALUE           MS-BAP-Usage            Required        2
+#       MS-ARAP-Password-Change-Reason Values
+VALUE   MS-ARAP-PW-Change-Reason        Just-Change-Password            1
+VALUE   MS-ARAP-PW-Change-Reason        Expired-Password                2
+VALUE   MS-ARAP-PW-Change-Reason        Admin-Requires-Password-Change  3
+VALUE   MS-ARAP-PW-Change-Reason        Password-Too-Short              4
+#       MS-Acct-Auth-Type Values
+VALUE           MS-Acct-Auth-Type       PAP             1
+VALUE           MS-Acct-Auth-Type       CHAP            2
+VALUE           MS-Acct-Auth-Type       MS-CHAP-1       3
+VALUE           MS-Acct-Auth-Type       MS-CHAP-2       4
+VALUE           MS-Acct-Auth-Type       EAP             5
+#       MS-Acct-EAP-Type Values
+VALUE           MS-Acct-EAP-Type        MD5             4
+VALUE           MS-Acct-EAP-Type        OTP             5
+VALUE           MS-Acct-EAP-Type        Generic-Token-Card      6
+VALUE           MS-Acct-EAP-Type        TLS             13
+END-VENDOR Microsoft
+EOF
+
+cat>/etc/radiusclient/dictionary.merit<<EOF
+#
+#       Experimental extensions, configuration only (for check-items)
+#       Names/numbers as per the MERIT extensions (if possible).
+#
+ATTRIBUTE       NAS-Identifier          32      string
+ATTRIBUTE       Proxy-State             33      string
+ATTRIBUTE       Login-LAT-Service       34      string
+ATTRIBUTE       Login-LAT-Node          35      string
+ATTRIBUTE       Login-LAT-Group         36      string
+ATTRIBUTE       Framed-AppleTalk-Link   37      integer
+ATTRIBUTE       Framed-AppleTalk-Network 38     integer
+ATTRIBUTE       Framed-AppleTalk-Zone   39      string
+ATTRIBUTE       Acct-Input-Packets      47      integer
+ATTRIBUTE       Acct-Output-Packets     48      integer
+# 8 is a MERIT extension.
+VALUE           Service-Type            Authenticate-Only       8
+EOF
+
+
+sed -i -e "/dictionary.merit/d" -e "/dictionary.microsoft/d" -e "/-Traffic/d" /etc/radiusclient/dictionary
+
+cat>>/etc/radiusclient/dictionary<<EOF
+INCLUDE /etc/radiusclient/dictionary.merit
+INCLUDE /etc/radiusclient/dictionary.microsoft
+EOF
+
+### disable ipv6 lines in the /etc/radiusclient/dictionary file 
+sed -i "s/ATTRIBUTE\tNAS-IPv6-Address\t95\tstring/#ATTRIBUTE\tNAS-IPv6-Address\t95\tstring/g"  /etc/radiusclient/dictionary
+sed -i "s/ATTRIBUTE\tFramed-Interface-Id\t96\tstring/#ATTRIBUTE\tFramed-Interface-Id\t96\tstring/g"  /etc/radiusclient/dictionary
+sed -i "s/ATTRIBUTE\tFramed-IPv6-Prefix\t97\tipv6prefix/#ATTRIBUTE\tFramed-IPv6-Prefix\t97\tipv6prefix/g"  /etc/radiusclient/dictionary
+sed -i "s/ATTRIBUTE\tLogin-IPv6-Host\t98\tstring/#ATTRIBUTE\tLogin-IPv6-Host\t98\tstring/g"  /etc/radiusclient/dictionary
+sed -i "s/ATTRIBUTE\tFramed-IPv6-Route\t99\tstring/#ATTRIBUTE\tFramed-IPv6-Route\t99\tstring/g"  /etc/radiusclient/dictionary
+sed -i "s/ATTRIBUTE\tFramed-IPv6-Pool\t100\tstring/#ATTRIBUTE\tFramed-IPv6-Pool\t100\tstring/g"  /etc/radiusclient/dictionary
+sed -i "s/ATTRIBUTE\tError-Cause\t101\tinteger/#ATTRIBUTE\tError-Cause\t101\tinteger/g"  /etc/radiusclient/dictionary
+sed -i "s/ATTRIBUTE\tEAP-Key-Name\t102\tstring/#ATTRIBUTE\tEAP-Key-Name\t102\tstring/g"  /etc/radiusclient/dictionary
+sed -i "s/ATTRIBUTE\tFramed-IPv6-Address\t168\tipv6addr/#ATTRIBUTE\tFramed-IPv6-Address\t168\tipv6addr/g"  /etc/radiusclient/dictionary
+sed -i "s/ATTRIBUTE\tDNS-Server-IPv6-Address\t169\tipv6addr/#ATTRIBUTE\tDNS-Server-IPv6-Address\t169\tipv6addr/g"  /etc/radiusclient/dictionary
+sed -i "s/ATTRIBUTE\tRoute-IPv6-Information\t170\tipv6prefix/#ATTRIBUTE\tRoute-IPv6-Information\t170\tipv6prefix/g"  /etc/radiusclient/dictionary
+
+cat <<'EOF'
+Radiusclient configuration completed.
+
+================================================
+EOF
+
+# Start services
+mkdir -p /run/pluto /var/run/pluto /var/run/xl2tpd /var/run/freeradius
+rm -f /run/pluto/pluto.pid /var/run/pluto/pluto.pid /var/run/xl2tpd.pid /var/run/freeradius/freeradius.pid
+
+# service rsyslog restart
+service pptpd restart
+service ipsec start
+
+#start libreswan
+#/usr/local/sbin/ipsec start
 exec /usr/sbin/xl2tpd -D -c /etc/xl2tpd/xl2tpd.conf

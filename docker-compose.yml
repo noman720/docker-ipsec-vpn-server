@@ -2,10 +2,10 @@ version: '3'
 
 services:
   vpn:
-    image: hwdsl2/ipsec-vpn-server
+    image: ipsec-vpn-server:dev
     restart: always
     env_file:
-      - ./vpn.env
+      - ./.env
     ports:
       - "500:500/udp"
       - "4500:4500/udp"
